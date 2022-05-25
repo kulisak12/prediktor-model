@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+
+from typing import List, Tuple
+import argparse
+import collections
+import datetime
+import numpy as np
+import os
+import pickle
+import re
+import tensorflow as tf
+
+# Report only TF errors by default
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+# tf.config.experimental_run_functions_eagerly(True)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--batch_size", default=32, type=int, help="Batch size.")
+parser.add_argument("--data_dir", default="data/", type=str, help="Path to directory with datasets.")
+parser.add_argument("--epochs", default=3, type=int, help="Number of epochs.")
+parser.add_argument("--rnn_dim", default=64, type=int, help="RNN cell dimension.")
+parser.add_argument("--seed", default=42, type=int, help="Random seed.")
+parser.add_argument("--threads", default=1, type=int, help="Maximum number of threads to use.")
+parser.add_argument("--we_dim", default=128, type=int, help="Word embedding dimension.")
+
+
+class PredictionModel(tf.keras.Model):
+    """RNN-based model which predicts next word in sentence."""
+
+    # According to:
+    # https://www.tensorflow.org/text/tutorials/text_generation
+
+    def __init__(self, word_mapping: tf.keras.layers.StringLookup) -> None:
+        super().__init__(self)
+        self.word_mapping = word_mapping
+        self.reverse_word_mapping = tf.keras.layers.StringLookup(
+            vocabulary=self.word_mapping.get_vocabulary(),
+            invert=True,
+            mask_token=None
+        )
+
+        self.embedding = tf.keras.layers.Embedding(self.word_mapping.vocabulary_size(), args.we_dim)
+        self.rnn = tf.keras.layers.GRU(args.rnn_dim, return_sequences=True, return_state=True)
+        self.dense = tf.keras.layers.Dense(self.word_mapping.vocabulary_size())
+
+    def call(self, inputs, states=None, return_state=False, training=False):
+        """One pass.
+
+        inputs: Tensor of words.
+        states: Initial states.
+
+        Returns: Distribution of next word ids.
+        """
+        x = inputs
+        x = self.word_mapping(x)
+        x = self.embedding(x, training=training)
+        if states is None:
+            states = self.rnn.get_initial_state(tf.zeros([args.batch_size]))
+        x, states = self.rnn(x, initial_state=states, training=training)
+        x = self.dense(x, training=training)
+
+        if return_state:
+            return x, states
+        else:
+            return x
+
+
+def get_vocabulary(filename: str) -> List[str]:
+    """Get most common words in a text file.
+
+    The result is cached and reused on sequent runs.
+    """
+
+    CACHE_FILE = "vocab.pickle"
+    VOCAB_SIZE = 10000
+
+    # use cached data
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "rb") as f:
+            return pickle.load(f)
+
+    # count frequency of each word in file
+    counter = collections.Counter()
+    with open(filename) as f:
+        for line in f:
+            counter.update(line.split(" "))
+
+    vocab = counter.most_common(VOCAB_SIZE)
+    vocab = list(map(lambda x: x[0], vocab))
+
+    # cache
+    with open(CACHE_FILE, "wb") as f:
+        pickle.dump(vocab, f)
+    return vocab
+
+
+def prepare_dataset(
+    filename: str,
+    word_mapping: tf.keras.layers.StringLookup,
+    train: bool = False
+) -> tf.data.Dataset:
+    """Create dataset from a text file.
+
+    The text file is expected to be preprocessed, one line per sentence, with tokens separated by spaces.
+    """
+
+    def add_targets(x: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        # targets are inputs shifted by one
+        inputs = x[:-1]
+        targets = x[1:]
+        targets = word_mapping(targets)
+        return inputs, targets
+
+    ds = tf.data.TextLineDataset(filename)
+    if train:
+        ds = ds.shuffle(buffer_size=10000, seed=args.seed)
+
+    ds = ds.map(lambda x: tf.strings.split(x, sep=" "))
+    ds = ds.map(add_targets)
+    ds = ds.apply(tf.data.experimental.dense_to_ragged_batch(args.batch_size))
+    return ds
+
+
+def main(args: argparse.Namespace) -> None:
+    # Fix random seeds and threads
+    tf.keras.utils.set_random_seed(args.seed)
+    tf.config.threading.set_inter_op_parallelism_threads(args.threads)
+    tf.config.threading.set_intra_op_parallelism_threads(args.threads)
+
+    # Create logdir name
+    args.logdir = os.path.join("logs", "{}-{}-{}".format(
+        os.path.basename(globals().get("__file__", "notebook")),
+        datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S"),
+        ",".join(("{}={}".format(re.sub("(.)[^_]*_?", r"\1", k), v) for k, v in sorted(vars(args).items())))
+    ))
+
+    # Load data
+
+    TRAIN_FILENAME = os.path.join(args.data_dir, "train.txt")
+    DEV_FILENAME = os.path.join(args.data_dir, "dev.txt")
+
+    vocab = get_vocabulary(TRAIN_FILENAME)
+    word_mapping = tf.keras.layers.StringLookup(vocabulary=vocab, mask_token=None)
+
+    # Create model
+
+    model = PredictionModel(word_mapping)
+    model.compile(
+        optimizer=tf.optimizers.Adam(),
+        loss=lambda yt, yp: tf.losses.SparseCategoricalCrossentropy(from_logits=True)(yt.values, yp.values),
+        metrics=[tf.metrics.SparseCategoricalAccuracy(name="accuracy")]
+    )
+    tb_callback = tf.keras.callbacks.TensorBoard(args.logdir)
+
+    # Train
+
+    train = prepare_dataset(TRAIN_FILENAME, word_mapping, train=True)
+    dev = prepare_dataset(DEV_FILENAME, word_mapping)
+
+    try:
+        model.fit(train, epochs=args.epochs, validation_data=dev, callbacks=[tb_callback])
+    except KeyboardInterrupt:  # if patience runs out
+        print()
+
+    model.save(os.path.join(args.logdir, "prediktor.model"))
+
+
+if __name__ == "__main__":
+    args = parser.parse_args([] if "__file__" not in globals() else None)
+    main(args)
