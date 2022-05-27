@@ -8,10 +8,10 @@ import numpy as np
 import os
 import pickle
 import re
-import tensorflow as tf
 
 # Report only TF errors by default
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+import tensorflow as tf
 # tf.config.experimental_run_functions_eagerly(True)
 
 parser = argparse.ArgumentParser()
