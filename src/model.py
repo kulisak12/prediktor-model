@@ -24,6 +24,9 @@ parser.add_argument("--threads", default=1, type=int, help="Maximum number of th
 parser.add_argument("--we_dim", default=128, type=int, help="Word embedding dimension.")
 
 
+SEQ_LENGTH = 20
+
+
 class PredictionModel(tf.keras.Model):
     """RNN-based model which predicts next word in sentence."""
 
@@ -31,38 +34,27 @@ class PredictionModel(tf.keras.Model):
     # https://www.tensorflow.org/text/tutorials/text_generation
 
     def __init__(self, word_mapping: tf.keras.layers.StringLookup) -> None:
-        super().__init__(self)
+        inputs = tf.keras.Input(shape=[SEQ_LENGTH - 1], dtype=tf.string)
+        features = word_mapping(inputs)
+        hidden = tf.keras.layers.Embedding(word_mapping.vocabulary_size(), args.we_dim)(features)
+        hidden = tf.keras.layers.GRU(args.rnn_dim, return_sequences=True)(hidden)
+        outputs = tf.keras.layers.Dense(word_mapping.vocabulary_size())(hidden)
+
+        super().__init__(inputs=inputs, outputs=outputs)
+        # Compile the model
+        self.compile(
+            optimizer=tf.optimizers.Adam(),
+            loss=tf.losses.SparseCategoricalCrossentropy(from_logits=True),
+            metrics=[tf.metrics.SparseCategoricalAccuracy(name="accuracy")],
+        )
+        self.tb_callback = tf.keras.callbacks.TensorBoard(args.logdir)
+
         self.word_mapping = word_mapping
         self.reverse_word_mapping = tf.keras.layers.StringLookup(
             vocabulary=self.word_mapping.get_vocabulary(),
             invert=True,
             mask_token=None
         )
-
-        self.embedding = tf.keras.layers.Embedding(self.word_mapping.vocabulary_size(), args.we_dim)
-        self.rnn = tf.keras.layers.GRU(args.rnn_dim, return_sequences=True, return_state=True)
-        self.dense = tf.keras.layers.Dense(self.word_mapping.vocabulary_size())
-
-    def call(self, inputs, states=None, return_state=False, training=False):
-        """One pass.
-
-        inputs: Tensor of words.
-        states: Initial states.
-
-        Returns: Distribution of next word ids.
-        """
-        x = inputs
-        x = self.word_mapping(x)
-        x = self.embedding(x, training=training)
-        if states is None:
-            states = self.rnn.get_initial_state(tf.zeros([args.batch_size]))
-        x, states = self.rnn(x, initial_state=states, training=training)
-        x = self.dense(x, training=training)
-
-        if return_state:
-            return x, states
-        else:
-            return x
 
 
 def get_vocabulary(filename: str) -> List[str]:
@@ -103,6 +95,18 @@ def prepare_dataset(
 
     The text file is expected to be preprocessed, one line per sentence, with tokens separated by spaces.
     """
+    def examples_from_line(line: tf.string) -> tf.Tensor:
+        """Create examples with a fixed number of tokens."""
+        tokens = tf.strings.split(line, sep=" ")
+        num_tokens = tf.shape(tokens)[0]
+        # drop remainder
+        num_tokens -= num_tokens % SEQ_LENGTH
+        num_examples = num_tokens // SEQ_LENGTH
+        tokens = tokens[:num_tokens]
+        # split into examples
+        examples = tf.reshape(tokens, [num_examples, SEQ_LENGTH])
+        return examples
+
 
     def add_targets(x: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
         # targets are inputs shifted by one
@@ -115,9 +119,10 @@ def prepare_dataset(
     if train:
         ds = ds.shuffle(buffer_size=10000, seed=args.seed)
 
-    ds = ds.map(lambda x: tf.strings.split(x, sep=" "))
+    ds = ds.map(examples_from_line)
+    ds = ds.unbatch()  # unroll examples into one tensor
     ds = ds.map(add_targets)
-    ds = ds.apply(tf.data.experimental.dense_to_ragged_batch(args.batch_size))
+    ds = ds.batch(args.batch_size)
     return ds
 
 
@@ -142,23 +147,15 @@ def main(args: argparse.Namespace) -> None:
     vocab = get_vocabulary(TRAIN_FILENAME)
     word_mapping = tf.keras.layers.StringLookup(vocabulary=vocab, mask_token=None)
 
-    # Create model
+    # Train
 
     model = PredictionModel(word_mapping)
-    model.compile(
-        optimizer=tf.optimizers.Adam(),
-        loss=lambda yt, yp: tf.losses.SparseCategoricalCrossentropy(from_logits=True)(yt.values, yp.values),
-        metrics=[tf.metrics.SparseCategoricalAccuracy(name="accuracy")]
-    )
-    tb_callback = tf.keras.callbacks.TensorBoard(args.logdir)
-
-    # Train
 
     train = prepare_dataset(TRAIN_FILENAME, word_mapping, train=True)
     dev = prepare_dataset(DEV_FILENAME, word_mapping)
 
     try:
-        model.fit(train, epochs=args.epochs, validation_data=dev, callbacks=[tb_callback])
+        model.fit(train, epochs=args.epochs, validation_data=dev, callbacks=[model.tb_callback])
     except KeyboardInterrupt:  # if patience runs out
         print()
 
