@@ -50,11 +50,6 @@ class PredictionModel(tf.keras.Model):
         self.tb_callback = tf.keras.callbacks.TensorBoard(args.logdir)
 
         self.word_mapping = word_mapping
-        self.reverse_word_mapping = tf.keras.layers.StringLookup(
-            vocabulary=self.word_mapping.get_vocabulary(),
-            invert=True,
-            mask_token=None
-        )
 
 
 def get_vocabulary(filename: str) -> List[str]:
