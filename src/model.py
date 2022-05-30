@@ -34,7 +34,7 @@ class PredictionModel(tf.keras.Model):
     # https://www.tensorflow.org/text/tutorials/text_generation
 
     def __init__(self, word_mapping: tf.keras.layers.StringLookup) -> None:
-        inputs = tf.keras.Input(shape=[SEQ_LENGTH - 1], dtype=tf.string)
+        inputs = tf.keras.Input(shape=[None], dtype=tf.string)
         features = word_mapping(inputs)
         hidden = tf.keras.layers.Embedding(word_mapping.vocabulary_size(), args.we_dim)(features)
         hidden = tf.keras.layers.GRU(args.rnn_dim, return_sequences=True)(hidden)
